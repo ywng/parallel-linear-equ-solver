@@ -116,7 +116,7 @@ void get_input(char filename[], int rank)
   }
 
   /* Now .. Filling the blanks */ 
-
+ 
   /* The initial values of Xs */
   for(i = 0; i < num; i++)
     fscanf(fp,"%f ", &x[i]);
@@ -177,6 +177,10 @@ int serial_solver()
   return nit;
 }
 
+/******************************************************/
+/* Calculate the error for each variable
+ * And output the largest one 
+ */
 float curr_max_err(float* new_x, float* old_x)
 {
   float max_err = 0;
@@ -187,9 +191,15 @@ float curr_max_err(float* new_x, float* old_x)
   }
   return max_err;
 }
+
 /******************************************************/
 /* Parallel by MPI
  * Idea: 
+ * 1. We split the data a, b, x across the processes. So they keep a_local, b_local and x_local
+ * 2. Each round, each process calculates the new variable value in their assigned x_local from the old_x. 
+ * 3. Then, the newly calculated x (x_local) from each process have to gather up and share across all processes for next round of calculation.
+ * 4. Repeat 2 & 3 until the solution converge (compare old_x and gathered new_x).
+ * 5. Place the converged solution to x array and output at root process.
  */
 int parallel_solver(int comm_size, int rank) 
 {
@@ -197,34 +207,65 @@ int parallel_solver(int comm_size, int rank)
   MPI_Bcast(&num, 1, MPI_INT, 0, MPI_COMM_WORLD);
   MPI_Bcast(&err, 1, MPI_FLOAT, 0, MPI_COMM_WORLD);
 
+  int *a_sendcounts;    // array describing how many elements to send to each process
+  int *a_displs;
+  int *bx_sendcounts;  
+  int *bx_displs;
+
+  a_sendcounts = malloc(sizeof(int)*comm_size);
+  a_displs = malloc(sizeof(int)*comm_size);
+  bx_sendcounts = malloc(sizeof(int)*comm_size);
+  bx_displs = malloc(sizeof(int)*comm_size);
+
+  // calculate send counts and displacements
+  int rem = num % comm_size;
+  int sum = 0;
+  for (int i = 0; i < comm_size; i++) {
+      a_sendcounts[i] = (num/comm_size) * num;
+      bx_sendcounts[i] = num/comm_size;
+      if (rem > 0) {
+          a_sendcounts[i] += num;
+          bx_sendcounts[i]++;
+          rem--;
+      }
+
+      a_displs[i] = sum * num;
+      bx_displs[i] = sum;
+      sum += bx_sendcounts[i];
+  }
+
+  //for debug
+  /*if (0 == rank) {
+    for (int i = 0; i < comm_size; i++) {
+      printf("bx_sendcounts[%d] = %d\tbx_displs[%d] = %d\n", i, bx_sendcounts[i], i, bx_displs[i]);
+    }
+  }*/
+
   float *a_local; 
   float *x_local;  
   float *b_local;  
 
-  int num_pproc = num / comm_size; /* equations per process */
-  if(rank==0)
-    printf("Number per process: %d: \n", num_pproc);
+  int num_pproc = bx_sendcounts[rank];
+ 
   a_local = (float *) malloc(num_pproc * num * sizeof(float));
   x_local = (float *) malloc(num_pproc * sizeof(float));
   b_local = (float *) malloc(num_pproc * sizeof(float));
 
   //scatter the matrix A
-  MPI_Scatter(a, num_pproc * num, MPI_FLOAT, a_local, 
+  MPI_Scatterv(a, a_sendcounts, a_displs, MPI_FLOAT, a_local, 
     num_pproc * num, MPI_FLOAT, 0, MPI_COMM_WORLD);
   //scatter the b
-  MPI_Scatter(b, num_pproc, MPI_FLOAT, b_local, 
+  MPI_Scatterv(b, bx_sendcounts, bx_displs, MPI_FLOAT, b_local, 
     num_pproc, MPI_FLOAT, 0, MPI_COMM_WORLD);
   //scatter the x
-  MPI_Scatter(x, num_pproc, MPI_FLOAT, x_local, 
+  MPI_Scatterv(x, bx_sendcounts, bx_displs, MPI_FLOAT, x_local, 
     num_pproc, MPI_FLOAT, 0, MPI_COMM_WORLD);
 
   int nit = 0;
   float *old_x = (float *) malloc(num * sizeof(float));
   float *new_x = (float *) malloc(num * sizeof(float));
-  MPI_Allgather(x_local, num_pproc, MPI_FLOAT, new_x,
-      num_pproc, MPI_FLOAT, MPI_COMM_WORLD);
-
-  //printf("Rank: %d  a_local: %f  b_local: %f  x_local: %f\n", rank, a_local[0], b_local[0], x_local[0]);
+  MPI_Allgatherv(x_local, num_pproc, MPI_FLOAT, new_x,
+      bx_sendcounts, bx_displs, MPI_FLOAT, MPI_COMM_WORLD);
 
   do
   {
@@ -232,7 +273,7 @@ int parallel_solver(int comm_size, int rank)
     SWAP(new_x, old_x);
     for(size_t i_local=0; i_local < num_pproc; i_local++)
     {
-      int i_global = rank * num_pproc + i_local;
+      int i_global = bx_displs[rank] + i_local;
       x_local[i_local] = b_local[i_local];
       for(size_t j=0; j<num; j++)
       {
@@ -244,25 +285,20 @@ int parallel_solver(int comm_size, int rank)
       x_local[i_local] /= a_local[i_local * num + i_global];
     }
 
-    MPI_Allgather(x_local, num_pproc, MPI_FLOAT, new_x,
-      num_pproc, MPI_FLOAT, MPI_COMM_WORLD);
+    MPI_Allgatherv(x_local, num_pproc, MPI_FLOAT, new_x,
+      bx_sendcounts, bx_displs, MPI_FLOAT, MPI_COMM_WORLD);
     
-    if(rank==1)
-      for(int i=0; i<num; i++) {
-        printf("Rank: %d new_x: %f \n", rank, new_x[i]);
-      }
   } while (curr_max_err(new_x, old_x) > err);
 
-
-  MPI_Gather(x_local, num_pproc, MPI_FLOAT, x,
-      num_pproc, MPI_FLOAT, 0, MPI_COMM_WORLD);
+  //put the final solution to x at root process for output
+  if(rank==0) 
+    SWAP(new_x, x);
 
   free(a_local);
   free(b_local);
   free(x_local);
 
   return nit;
-
 }
 
 void clean_up() {
