@@ -95,7 +95,7 @@ void get_input(char filename[], int rank)
 
   /* Now, time to allocate the matrices and vectors */
   a = (float*)malloc(num * num * sizeof(float));
-  if( !a)
+  if(!a)
   {
     printf("Cannot allocate a!\n");
     exit(1);
@@ -109,7 +109,7 @@ void get_input(char filename[], int rank)
   }
 
   b = (float *) malloc(num * sizeof(float));
-  if( !b)
+  if(!b)
   {
 	 printf("Cannot allocate b!\n");
 	 exit(1);
@@ -330,8 +330,16 @@ int main(int argc, char *argv[])
 
   if(rank == 0) 
   {
+    double MPI_Wtime(void);
+    double start, finish;
+
+    start = MPI_Wtime();
+
     /* Read the input file and fill the global data structure above */ 
     get_input(argv[1], rank);
+
+    finish = MPI_Wtime();
+    //printf("Time taken for reading input = %e seconds\n", finish-start);
 
     /* Check for convergence condition */
     /* This function will exit the program if the coffeicient will never converge to 
